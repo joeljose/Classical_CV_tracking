@@ -45,6 +45,12 @@ def hist_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(1.0 - cv2.compareHist(a, b, cv2.HISTCMP_BHATTACHARYYA))
 
 
+# Flat (cell, bin) index of every HOG pixel, for one bincount per patch.
+_HOG_CY, _HOG_CX = _HOG_SIZE[1] // _HOG_CELL, _HOG_SIZE[0] // _HOG_CELL
+_HOG_CELL_IDX = ((np.arange(_HOG_SIZE[1])[:, None] // _HOG_CELL) * _HOG_CX
+                 + np.arange(_HOG_SIZE[0])[None, :] // _HOG_CELL) * _HOG_BINS
+
+
 def hog_vector(patch_bgr: np.ndarray) -> np.ndarray:
     """Dalal-Triggs style HOG: unsigned gradients, 8x8 cells, 2x2 L2-Hys blocks."""
     gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
@@ -52,16 +58,15 @@ def hog_vector(patch_bgr: np.ndarray) -> np.ndarray:
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=1)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=1)
     mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=True)
-    bins = ((ang % 180.0) / (180.0 / _HOG_BINS)).astype(np.int32) % _HOG_BINS
-    cy, cx = _HOG_SIZE[1] // _HOG_CELL, _HOG_SIZE[0] // _HOG_CELL
-    onehot = (bins[..., None] == np.arange(_HOG_BINS)) * mag[..., None]
-    cells = onehot.reshape(cy, _HOG_CELL, cx, _HOG_CELL, _HOG_BINS).sum(axis=(1, 3))
+    bins = ((ang % 180.0) * (_HOG_BINS / 180.0)).astype(np.int32) % _HOG_BINS
+    cells = np.bincount((_HOG_CELL_IDX + bins).ravel(), mag.ravel(),
+                        _HOG_CY * _HOG_CX * _HOG_BINS).reshape(_HOG_CY, _HOG_CX, _HOG_BINS)
     blocks = np.concatenate([cells[:-1, :-1], cells[:-1, 1:], cells[1:, :-1], cells[1:, 1:]], axis=2)
-    blocks = blocks / (np.linalg.norm(blocks, axis=2, keepdims=True) + 1e-6)
-    blocks = np.minimum(blocks, 0.2)
-    blocks = blocks / (np.linalg.norm(blocks, axis=2, keepdims=True) + 1e-6)
+    blocks /= np.sqrt((blocks * blocks).sum(axis=2, keepdims=True)) + 1e-6
+    np.minimum(blocks, 0.2, out=blocks)
+    blocks /= np.sqrt((blocks * blocks).sum(axis=2, keepdims=True)) + 1e-6
     v = blocks.ravel()
-    n = np.linalg.norm(v)
+    n = np.sqrt(v @ v)
     return v / n if n > 0 else v
 
 

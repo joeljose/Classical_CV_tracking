@@ -84,7 +84,7 @@ and local appearance.
 | E8 | same, tolerance 1.2 | 0.69 | 0.82 | 0.54 | 0.89 | 32 | 63 |
 | E9 | same, refined windows only | 0.55 | 0.79 | 0.63 | 0.97 | 0 | 68 |
 
-E4 is the default now. E5 shows the identity floor is not the limit any
+E4 became the default at this stage. E5 shows the identity floor is not the limit any
 more. E7 to E9 tried to fix loose boxes on merged blobs by refusing raw
 blobs that are not car-shaped. Recall went up a little for the Audi, but
 the tracker then picked up another silver car for a while, and with a
@@ -107,17 +107,81 @@ each car's pass, where appearance cannot separate it from other cars of
 the same colour (see the score table above). Once a car is 200 px wide it
 is found in every frame.
 
-On the synthetic clip the same defaults also do better than the old ones:
+On the synthetic clip the E4 settings also did better than the old ones:
 Audi recall 0.70 to 0.74, Toyota 0.86 to 0.995, still with no swaps and no
 boxes while hidden.
+
+## Speed: full detection every N frames
+
+E4 ran at about 4 fps for one pass, so about 2 fps with both passes. A
+profile of the densest stretch (frames 900 to 1200) put 59 percent of the
+time in HOG, 25 percent in SIFT and under 3 percent in MOG2. HOG was slow
+because the window search scores about 600 windows per frame.
+
+Two changes went in.
+
+1. HOG now builds its cell histograms with one `np.bincount` call instead
+   of a one-hot array. Same output (largest difference 2e-8), 195 to 86
+   microseconds per patch. OpenCV's own `HOGDescriptor` was the first
+   choice, but OpenCV 5.0 moved it out of the main package.
+2. `--detect-every N` runs the full pipeline only every Nth frame. At 50
+   fps a car moves a few pixels per frame, so in between each track is
+   followed by a template match near its Kalman prediction.
+
+The first version of the cheap frames drifted badly. Each problem it showed
+had a specific cause, and fixing it also helped the every-frame mode:
+
+| problem seen | cause | fix |
+| --- | --- | --- |
+| box turned into a thin strip (30x172, 398x62) | the filter's width and height drift apart when only template matches correct it | predictions are always car-shaped: width from the filter, height from the reference's aspect ratio |
+| Toyota slid onto the Audi next to it | nothing checked identity between detections | a followed box that looks more like the other reference (colour) sends the frame to full detection |
+| track sat on the road at the horizon for 400 frames (backward pass) | NCC matches static background very well | a followed box must be at least 30 percent moving foreground |
+| false start at frame 0 with N=10 | acquisition needed only 2 detection frames | every frame runs the full pipeline while an acquisition is pending |
+| Audi box jumped to a neighbour as the Audi left the frame | while the car is partly out, the car-shaped window slides up onto the next car | once the box reaches the bottom edge, the car gets as many frames as it needs to be half out at its current speed, then it is `exited` |
+| box stopped growing between detections (synthetic clip, 25 fps) | template matched at one size only | template match at three scales |
+
+Results after these changes (same ground truth as above):
+
+| mode | N | Audi recall | Audi precision | Toyota recall | Toyota precision | swaps | hidden |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| forward only | 1 | 0.55 | 0.89 | 0.53 | 1.00 | 0 | 21 |
+| forward only | 5 | 0.55 | 0.99 | 0.49 | 1.00 | 0 | 0 |
+| forward only | 10 | 0.46 | 0.80 | 0.52 | 1.00 | 0 | 54 |
+| two passes | 1 | 0.89 | 0.93 | 0.86 | 0.97 | 0 | 21 |
+| two passes | 5 | 0.89 | 0.96 | 0.81 | 0.96 | 0 | 0 |
+| two passes | 10 | 0.89 | 0.87 | 0.85 | 1.00 | 0 | 54 |
+
+Car-shaped predictions are what lifted two-pass recall from about 0.65 to
+about 0.85. N=5 is the only setting with no boxes on a wrong car in either
+mode, so it is the default. At N=1 and N=10 the Audi track still slides
+onto another silver car for a short stretch (21 and 54 frames). On the
+synthetic clip N=5 gives Audi 0.65 / 0.95 and Toyota 1.00 / 1.00 (recall /
+precision), with no swaps and no boxes while hidden.
+
+Timing, tracking only, one run at a time. Other work was sometimes running
+on the machine, and these were measured just before the last two fixes
+(exit countdown, three-scale template), which add a little work on the
+cheap frames. Treat them as approximate.
+
+| mode | N=1 | N=5 | N=10 |
+| --- | --- | --- | --- |
+| forward only | 6.2 fps | 23.3 fps | 39.1 fps |
+| two passes | 3.2 fps | 11.5 fps | 17.6 fps |
+
+The source is 50 fps. Forward-only at N=5 keeps up with a 20 to 25 fps
+stream. Two passes cannot run live at any speed, because the backward pass
+starts from the last frame.
 
 ## Reproducing
 
 ```bash
-make gt-all                                   # ground truth (GPU)
-make track OUT=output/e4                      # current defaults
-make track OUT=output/e1 ARGS="--forward-only --identity-threshold 0.72"
-make track OUT=output/baseline ARGS="--forward-only --no-reacquire --acquire-threshold 0.66 \
-    --acquire-min-width 0 --confirm-frames 3 --identity-threshold 0.594"
-make eval OUT=output/e4
+make gt-all                                          # ground truth (GPU)
+make track OUT=output/final                          # current defaults
+make track OUT=output/n1 ARGS="--detect-every 1"     # full detection every frame
+make track OUT=output/fwd ARGS="--forward-only"      # live-capable mode
+make eval OUT=output/final
 ```
+
+The earlier runs (baseline, E1 to E9) used earlier versions of the code,
+and their numbers will not come back exactly from flags on the current
+version. The first commit of this repository holds the E4 version.

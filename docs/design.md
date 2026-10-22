@@ -30,7 +30,9 @@ Some facts about the clip shaped the design:
    Audi, it should say "searching", not guess.
 3. Nothing is selected by hand in the video. The only target description is
    the reference photo.
-4. Run on a laptop CPU in a reasonable time, with OpenCV and NumPy only.
+4. Run on a laptop CPU with OpenCV and NumPy only. Offline at a useful
+   speed by default, and fast enough for a live 20 to 25 fps stream in
+   forward-only mode.
 
 ## Architecture
 
@@ -86,6 +88,21 @@ its score falls well below the track's running average. That second test is
 the main defence against latching onto a look-alike when the real target is
 hidden.
 
+### Frames between full detections
+
+The full pipeline runs every `--detect-every` frames (5 by default). On the
+frames in between, MOG2 still updates, and each active track is followed by
+a normalised cross-correlation search near its prediction at three scales.
+The match is used only if it is at least 30 percent moving foreground and
+does not look more like the other reference by colour. If any track fails
+those checks, or a car is leaving the frame, or an acquisition is in
+progress, that frame runs the full pipeline instead.
+
+Predictions are kept car-shaped everywhere: the width comes from the Kalman
+filter and the height from the reference's aspect ratio. Without that, the
+filter's width and height drift apart when only template matches correct
+them, and the gates and searches then look in the wrong place.
+
 ### Occlusion and loss
 
 When no candidate is associated, a normalised cross-correlation search runs
@@ -93,10 +110,16 @@ in a small window around the prediction, using the last confirmed patch as
 the template. If it finds a match that still scores well against the
 reference, the frame is `tracked_template`. Otherwise the frame is
 `occluded` and no box is written. After `--max-coast` frames without a
-measurement the track becomes `lost` and acquisition starts again. When the
-predicted box leaves the frame the target becomes `exited` and by default is
-not picked up again, because any later car with the same colour would
-inherit the identity.
+measurement the track becomes `lost` and acquisition starts again.
+
+A car leaves through the bottom of the frame. Once its box reaches the
+bottom edge it gets as many frames as it needs, at its current speed, to be
+half out of view, and then it is `exited`. Waiting longer is risky: with
+the car partly out, a car-shaped window slides up onto whatever is next to
+it. The exit check runs on the prediction before association, so a car
+that is leaving cannot hand its identity to a neighbour. A target can be
+acquired again after it exits, so one wrong early acquisition does not end
+the run.
 
 ### Acquisition
 
@@ -104,6 +127,22 @@ An inactive target is acquired only when the same candidate scores above
 `--acquire-threshold` for `--confirm-frames` frames in a row at a consistent
 location, and beats the other reference by a margin. The confirming frames
 are back-filled as `tracked`, since they were real matches.
+
+### Two passes (`track_vehicles.py`)
+
+A car can only be identified once it is close: below about 160 original
+pixels wide, the true car's score overlaps with other cars of the same
+colour (see `experiments.md`). Cars drive toward the camera, so in the
+forward direction the far-away part of each pass is lost. The clip is
+therefore tracked twice, forwards and then backwards over the same decoded
+frames, and the results are merged per frame. In the backward pass each car
+is acquired while it is large and followed back toward the horizon. Where
+both passes measured the car, the higher-scoring box is kept. Frames are
+decoded once, downscaled and kept JPEG-encoded in memory, so the backward
+pass does not have to seek in the video.
+
+This makes the default mode offline. `--forward-only` skips the backward
+pass for live use.
 
 ## Ground truth and evaluation
 

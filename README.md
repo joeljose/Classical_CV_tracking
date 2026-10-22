@@ -58,7 +58,7 @@ says why.
 | `tracked_template` | yes | No candidate matched, but a short-range NCC search near the prediction found the car and it still matches the reference. |
 | `occluded` | no | The track is alive but there is no reliable measurement. The Kalman prediction is used internally and never written out. |
 | `lost` | no | Unmeasured for more than `--max-coast` frames, or the matches kept scoring poorly. Acquisition starts again. |
-| `exited` | no | The predicted box left the frame. |
+| `exited` | no | The car drove out of view (its box reached the bottom edge and it is about half out, or the predicted box left the frame). |
 
 Boxes are `x, y, w, h` in original-resolution pixels and `time_s = frame / fps`.
 
@@ -90,6 +90,11 @@ The short version is below. `docs/design.md` has the full design and
    can only be identified once they are close. Played backwards, each car
    is picked up while it is large and followed back to where it first
    appeared.
+8. Full detection every 5th frame (`--detect-every`). In between, each
+   track is followed by a template match at three scales near its Kalman
+   prediction, checked against the foreground mask and the colour model.
+   Anything doubtful (a weak match, a car leaving the frame, an acquisition
+   in progress) sends that frame through the full pipeline instead.
 
 ## Results on the real clip
 
@@ -102,17 +107,36 @@ agreement with a strong detector rather than accuracy against hand labels.
 
 | | recall (IoU 0.5) | precision (IoU 0.3) | identity swaps | boxes where GT has none |
 | --- | --- | --- | --- | --- |
-| Silver Audi (499 frames in view) | 0.66 | 0.98 | 0 | 0 |
-| Blue Toyota (608 frames in view) | 0.61 | 0.97 | 0 | 7 |
+| Silver Audi (499 frames in view) | 0.89 | 0.96 | 0 | 0 |
+| Blue Toyota (608 frames in view) | 0.81 | 0.96 | 0 | 0 |
 
 The settings that came from tuning on a synthetic clip scored zero on the
 real one. They acquired look-alike cars in the first second and never
 recovered. `docs/experiments.md` walks through what went wrong, the score
 analysis that fixed it, and every run.
 
-Most of the missed frames are at the start of each pass, when the car is
-under about 100 px wide and looks like several other cars of the same
+Most of the remaining misses are at the far end of each pass, when the car
+is under about 100 px wide and looks like several other cars of the same
 colour. The tracker reports `searching` there instead of guessing.
+
+## Speed
+
+Measured on a 12-core laptop CPU at the default processing width of 960 px,
+tracking only (decoding adds about 10 s for the clip). These were measured
+one run at a time, but other work was sometimes running on the machine, so
+treat them as approximate. Every run writes its own timing to
+`summary.json` under `timing`.
+
+| | full detection every frame | every 5th frame (default) | every 10th frame |
+| --- | --- | --- | --- |
+| forward only (`--forward-only`) | 6 fps | 23 fps | 39 fps |
+| two passes (default) | 3 fps | 11 fps | 18 fps |
+
+Forward-only can run on a live stream and keeps up with a 20 to 25 fps
+camera at the default setting. The two-pass mode needs the end of the clip
+before it can start, so it is offline only. Every 10th frame is faster but
+lets the Audi track slide onto another car for about 50 frames on this clip,
+which is why the default is 5. Details are in `docs/experiments.md`.
 
 To rebuild the ground truth you need an NVIDIA GPU and the ONNX model from
 the [vehicle-tracker](https://github.com/joeljose/vehicle-tracker) project:
@@ -136,7 +160,8 @@ reference, and `candidates.csv` has the same numbers. Set
 the best look-alikes. Other options are `--keep-threshold`,
 `--identity-threshold`, `--acquire-min-width`, `--confirm-frames`,
 `--max-coast`, `--min-area` and `--process-width` (frames wider than this
-are downscaled, default 960). `--forward-only` skips the backward pass.
+are downscaled, default 960). `--forward-only` skips the backward pass and
+`--detect-every N` sets how often the full detection runs.
 
 ## Testing
 
@@ -170,8 +195,11 @@ refs/                      the two reference images
   tell apart from similar cars. Those frames stay `searching`.
 - When the two targets drive side by side their blob merges, and the box
   can come out loose (IoU between 0.3 and 0.5 with the ground truth).
-- Two passes plus SIFT make it slow: about 25 minutes for the one-minute
-  1080p clip on a laptop CPU. `--forward-only` halves that.
+- The default two-pass mode is offline only and runs at about 11 fps.
+  Live use needs `--forward-only`, which loses most of the early, far-away
+  frames (recall about 0.5 instead of 0.85).
+- A car is called `exited` once it is about half out of the bottom of the
+  frame, so its last few partly visible frames are not reported.
 - A car of very similar colour and shape, in the same place, during an
   occlusion could still be mistaken for a target. The relative-score check
   reduces this but does not remove it.

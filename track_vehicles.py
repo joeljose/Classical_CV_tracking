@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -52,6 +53,8 @@ def parse_args() -> argparse.Namespace:
                    help="narrowest candidate (processing pixels) that may start a track")
     p.add_argument("--no-reacquire", action="store_true",
                    help="never acquire a target again after it left the frame")
+    p.add_argument("--detect-every", type=int, default=d.detect_every,
+                   help="run full detection every N frames and follow by template matching in between")
     p.add_argument("--forward-only", action="store_true",
                    help="skip the backward pass (faster, lower recall on cars approaching the camera)")
     return p.parse_args()
@@ -154,18 +157,23 @@ def main() -> None:
                         identity_threshold=args.identity_threshold,
                         acquire_min_width=args.acquire_min_width,
                         reacquire_after_exit=not args.no_reacquire,
+                        detect_every=args.detect_every,
                         detector=DetectorConfig(min_area=args.min_area))
 
     frames, fps, inv = read_frames(args.video, args.process_width)
     if args.max_frames:
         frames = frames[:args.max_frames]
     n = len(frames)
+    t0 = time.perf_counter()
     history, cands = run_pass(refs, cfg, frames, range(n), args.debug_candidates)
+    timing = {"forward_s": round(time.perf_counter() - t0, 1)}
     if not args.forward_only:
         # Cars drive towards the camera, so they are identifiable late (large)
         # and not early (small). Running the clip backwards acquires each car
         # while it is large and follows it back to where it first appeared.
+        t0 = time.perf_counter()
         back, _ = run_pass(refs, cfg, frames, range(n - 1, -1, -1), False)
+        timing["backward_s"] = round(time.perf_counter() - t0, 1)
         back = [[FrameResult(n - 1 - r.frame, r.target, r.status, r.box, r.score) for r in row]
                 for row in reversed(back)]
         history = merge(history, back)
@@ -210,7 +218,9 @@ def main() -> None:
                 for box, scores in cs:
                     wr.writerow([idx, *scale_box(box, inv), *(f"{scores[n]:.4f}" for n in names)])
 
-    summary = {"video": args.video, "frames": n, "fps": fps, "targets": {}}
+    track_s = sum(timing.values())
+    timing["tracking_fps"] = round(n / track_s, 2) if track_s else None
+    summary = {"video": args.video, "frames": n, "fps": fps, "timing": timing, "targets": {}}
     for k, name in enumerate(names):
         rows = [h[k] for h in history]
         located = [r.frame for r in rows if r.status.has_position]

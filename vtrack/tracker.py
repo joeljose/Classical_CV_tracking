@@ -61,6 +61,7 @@ class TrackerConfig:
     online_rate: float = 0.1          # online colour-model adaptation rate
     exit_margin: float = 0.35         # fraction of predicted box outside frame -> exited
     reacquire_after_exit: bool = True
+    detect_every: int = 5             # full detection every N frames, template following in between
     detector: DetectorConfig = field(default_factory=DetectorConfig)
 
 
@@ -83,6 +84,7 @@ class _Target:
     score_ema: float | None = None  # running mean of accepted reference scores
     template: np.ndarray | None = None
     pending: list[tuple[int, Box, float]] = field(default_factory=list)
+    exit_in: int | None = None  # frames left once the box reached the bottom edge
 
     @property
     def name(self) -> str:
@@ -108,8 +110,24 @@ class VehicleTracker:
     def process(self, frame: np.ndarray) -> list[FrameResult]:
         self.frame_idx += 1
         cfg = self.cfg
+        # The filter tracks width and height separately and its size can drift
+        # without a measurement; a car keeps its shape, so derive the height.
+        predictions = {i: self._car_shaped(t.kf.predict(), t.model.aspect)
+                       for i, t in enumerate(self.targets) if t.active}
+        # A car leaving the frame is done before association, otherwise its
+        # large gate can hand the identity to a neighbour that is still in view.
+        exits = {}
+        for i, pred in list(predictions.items()):
+            if self._outside_fraction(pred, frame.shape) > cfg.exit_margin:
+                self._drop(self.targets[i], Status.EXITED)
+                exits[i] = FrameResult(self.frame_idx, self.targets[i].name, Status.EXITED)
+                del predictions[i]
+        if self.frame_idx % cfg.detect_every and not exits:
+            out = self._follow(frame, predictions)
+            if out is not None:
+                self.history.append(out)
+                return out
         blobs = [b for b in (clip_box(b, frame.shape) for b in self.detector.detect(frame)) if b]
-        predictions = {i: t.kf.predict() for i, t in enumerate(self.targets) if t.active}
         boxes = self._proposals(frame, blobs, predictions)
         patches = [crop(frame, b) for b in boxes]
         ref_scores = np.array([[t.model.score(p).total for p in patches] for t in self.targets]
@@ -118,7 +136,7 @@ class VehicleTracker:
             (b, {t.name: float(ref_scores[i, j]) for i, t in enumerate(self.targets)})
             for j, b in enumerate(boxes)]
 
-        results: dict[int, FrameResult] = {}
+        results: dict[int, FrameResult] = dict(exits)
 
         # --- 1. associate active tracks --------------------------------------
         assignment = self._associate(predictions, boxes, patches, ref_scores)
@@ -149,6 +167,44 @@ class VehicleTracker:
 
         out = [results[i] for i in range(len(self.targets))]
         self.history.append(out)
+        return out
+
+    def _follow(self, frame, predictions: dict[int, Box]) -> list[FrameResult] | None:
+        """Cheap frame between full detections: keep the background model
+        current and follow active tracks by template matching. Returns None
+        when anything needs a full look (an acquisition in progress, a track
+        leaving the frame, a weak or suspicious match), and the caller then
+        runs the full pipeline on this frame."""
+        if any(t.pending for t in self.targets):
+            return None
+        fg = self.detector.foreground_mask(frame)
+        self.last_candidates = []
+        found = {}
+        for i, pred in predictions.items():
+            t = self.targets[i]
+            if self._outside_fraction(pred, frame.shape) > 0.1:
+                return None
+            hit = self._template_search(t, frame, pred, verify=False)
+            if hit is None:
+                return None
+            # A template can lock onto static background (the road at the
+            # horizon matches well); a real vehicle is moving foreground.
+            if np.count_nonzero(crop(fg, hit[0])) < 0.3 * hit[0][2] * hit[0][3]:
+                return None
+            patch = crop(frame, hit[0])
+            own = t.model.color_score(patch)
+            if any(o.model.color_score(patch) > own for o in self.targets if o is not t):
+                return None
+            found[i] = hit[0]
+        out = []
+        for i, t in enumerate(self.targets):
+            if i in found:
+                t.kf.correct(found[i])
+                t.missed = 0
+                t.status = Status.TRACKED_TEMPLATE
+                out.append(FrameResult(self.frame_idx, t.name, t.status, found[i], t.score_ema))
+            else:
+                out.append(FrameResult(self.frame_idx, t.name, t.status))
         return out
 
     # ------------------------------------------------------------- proposals
@@ -258,6 +314,21 @@ class VehicleTracker:
 
     def _accept(self, t: _Target, frame, box: Box, score: float, status: Status) -> FrameResult:
         cfg = self.cfg
+        if box[1] + box[3] >= frame.shape[0] - 2:
+            # Reached the bottom edge: the car is driving out of view. Once it
+            # is partly out, a car-shaped window slides up onto whatever is
+            # next to it, so give it only as many frames as it takes to be
+            # half out at its current speed, then call it exited.
+            if t.exit_in is None:
+                v = t.kf.kf.statePost.ravel()
+                t.exit_in = max(1, int(0.5 * box[3] / max(float(v[5] + v[7] / 2), 0.5)))
+            t.exit_in -= 1
+            if t.exit_in <= 0:
+                self._drop(t, Status.EXITED)
+                return FrameResult(self.frame_idx, t.name, Status.EXITED)
+        if self._mostly_out(box, frame.shape, t.model.aspect):
+            self._drop(t, Status.EXITED)
+            return FrameResult(self.frame_idx, t.name, Status.EXITED)
         t.kf.correct(box)
         t.missed = 0
         t.status = status
@@ -295,6 +366,7 @@ class VehicleTracker:
         t.low_score_run = 0
         t.score_ema = None
         t.template = None
+        t.exit_in = None
         t.pending.clear()
         t.model.reset_online()
 
@@ -310,30 +382,58 @@ class VehicleTracker:
         return floor
 
     @staticmethod
+    def _car_shaped(box: Box, aspect: float) -> Box:
+        x, y, w, h = box
+        nh = max(1, int(round(w / aspect)))
+        return (x, int(round(y + h / 2 - nh / 2)), w, nh)
+
+    @staticmethod
+    def _mostly_out(box: Box, shape, aspect: float) -> bool:
+        """Box touches the top or a side edge and shows under half of a car of
+        that size. The bottom edge is handled by the exit countdown."""
+        x, y, w, h = box
+        H, W = shape[:2]
+        if y <= 1:
+            return h * aspect < 0.5 * w
+        if x + w >= W - 2 or x <= 1:
+            return w < 0.5 * h * aspect
+        return False
+
+    @staticmethod
     def _outside_fraction(box: Box, shape) -> float:
         inside = clip_box(box, shape)
         area = max(box[2] * box[3], 1)
         return 1.0 - (inside[2] * inside[3] / area if inside else 0.0)
 
     # -------------------------------------------------------- template search
-    def _template_search(self, t: _Target, frame, pred: Box) -> tuple[Box, float] | None:
+    def _template_search(self, t: _Target, frame, pred: Box,
+                         verify: bool = True) -> tuple[Box, float] | None:
         cfg = self.cfg
         if t.template is None or t.missed > cfg.max_coast // 2:
             return None
         px, py, pw, ph = pred
         if pw < 12 or ph < 12:
             return None
-        tmpl = cv2.resize(t.template, (pw, ph), interpolation=cv2.INTER_LINEAR)
         mx, my = pw // 2, ph // 2
         region = clip_box((px - mx, py - my, pw + 2 * mx, ph + 2 * my), frame.shape)
-        if region is None or region[2] <= pw or region[3] <= ph:
+        if region is None:
             return None
         gray = cv2.cvtColor(crop(frame, region), cv2.COLOR_BGR2GRAY)
-        res = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, ncc, _, loc = cv2.minMaxLoc(res)
-        if ncc < cfg.template_threshold:
+        # A few scales, so frames between full detections still measure growth.
+        ncc, box = -1.0, None
+        for s in (0.94, 1.0, 1.06):
+            w, h = int(round(pw * s)), int(round(ph * s))
+            if w >= gray.shape[1] or h >= gray.shape[0]:
+                continue
+            res = cv2.matchTemplate(gray, cv2.resize(t.template, (w, h), interpolation=cv2.INTER_LINEAR),
+                                    cv2.TM_CCOEFF_NORMED)
+            _, v, _, loc = cv2.minMaxLoc(res)
+            if v > ncc:
+                ncc, box = v, (region[0] + loc[0], region[1] + loc[1], w, h)
+        if box is None or ncc < cfg.template_threshold:
             return None
-        box = (region[0] + loc[0], region[1] + loc[1], pw, ph)
+        if not verify:
+            return box, ncc
         ref = t.model.score(crop(frame, box)).total
         if ref < self._min_ref(t):
             return None
