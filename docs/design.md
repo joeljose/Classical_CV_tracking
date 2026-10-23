@@ -88,13 +88,30 @@ its score falls well below the track's running average. That second test is
 the main defence against latching onto a look-alike when the real target is
 hidden.
 
+### Two memories: the photo and the recent looks
+
+Each track compares candidates against two things. The reference photo is
+fixed and decides identity: acquisition, the keep floor and the "looks
+more like the other car" test all use it. Next to it, each track keeps a
+gallery of the colour histograms and HOG of its last 10 confident looks. A
+look is added, and the template replaced, only when the match scores at
+least as well against the photo as the track usually does, so one doubtful
+frame cannot redefine the car. A candidate or a template match must
+resemble the gallery with similarity of at least `--gallery-floor` (0.75).
+
+Both are needed. The photo alone is weak when the car is small or lit
+differently, and a neighbour of the same colour can fit it as well as the
+target. The gallery alone would follow its own drift. Together, a match
+has to fit the photo and also look like the car did a moment ago.
+
 ### Frames between full detections
 
-The full pipeline runs every `--detect-every` frames (5 by default). On the
+The full pipeline runs every `--detect-every` frames (10 by default). On the
 frames in between, MOG2 still updates, and each active track is followed by
 a normalised cross-correlation search near its prediction at three scales.
-The match is used only if it is at least 30 percent moving foreground and
-does not look more like the other reference by colour. If any track fails
+The match is used only if it is at least 30 percent moving foreground,
+resembles the track's gallery, and does not look more like the other
+reference by colour. If any track fails
 those checks, or a car is leaving the frame, or an acquisition is in
 progress, that frame runs the full pipeline instead.
 
@@ -141,8 +158,11 @@ both passes measured the car, the higher-scoring box is kept. Frames are
 decoded once, downscaled and kept JPEG-encoded in memory, so the backward
 pass does not have to seek in the video.
 
-This makes the default mode offline. `--forward-only` skips the backward
-pass for live use.
+This only works on a recorded video: the backward pass starts from the
+last frame, so the whole clip must exist before it can begin. For a live
+camera, `--forward-only` skips the backward pass and handles frames as they
+arrive, at the cost of the far-away frames (recall about 0.5 instead of
+about 0.87 on this clip).
 
 ## Ground truth and evaluation
 

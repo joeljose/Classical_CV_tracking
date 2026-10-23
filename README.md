@@ -17,6 +17,11 @@ Kalman filter.
 *Real clip. Coloured boxes are the tracker, thin white boxes are the
 detector-based ground truth used for evaluation.*
 
+The input clip and the result videos are attached to the
+[v1.0 release](https://github.com/joeljose/Classical_CV_tracking/releases/tag/v1.0):
+`1900-151662242.mp4` (input), `annotated.mp4` (tracker output),
+`compare.mp4` (tracker against ground truth) and `tracks.csv`.
+
 ## Quick start
 
 Everything runs in Docker through `make`. The tracker image is CPU only.
@@ -78,8 +83,11 @@ The short version is below. `docs/design.md` has the full design and
    least 60 px wide a SIFT match verified with RANSAC.
 4. Association. Gated by distance and size around the prediction, solved
    jointly so the two targets never share a box. A candidate that looks
-   more like the other reference, or scores far below the track's usual
-   score, is refused.
+   more like the other reference, scores far below the track's usual
+   score, or does not resemble the car's recent looks, is refused.
+   Each track keeps a small gallery of its last 10 confident looks (colour
+   and HOG). The reference photo decides identity; the gallery tells the
+   car apart from a neighbour that fits the photo just as well.
 5. Occlusion. With no candidate, a local NCC search runs around the
    prediction. If that fails the frame is `occluded` and no box is written.
 6. Acquisition. A target starts only when a candidate at least 80 px wide
@@ -90,11 +98,41 @@ The short version is below. `docs/design.md` has the full design and
    can only be identified once they are close. Played backwards, each car
    is picked up while it is large and followed back to where it first
    appeared.
-8. Full detection every 5th frame (`--detect-every`). In between, each
+8. Full detection every 10th frame (`--detect-every`). In between, each
    track is followed by a template match at three scales near its Kalman
-   prediction, checked against the foreground mask and the colour model.
+   prediction, checked against the foreground mask, the gallery and the
+   other car's colours.
    Anything doubtful (a weak match, a car leaving the frame, an acquisition
    in progress) sends that frame through the full pipeline instead.
+
+## Two passes, and why it needs a recorded video
+
+By default the clip is tracked twice: once forwards, from the first frame
+to the last, and once backwards, from the last frame to the first. The two
+results are then merged frame by frame.
+
+The reason is the direction the cars drive. They come toward the camera, so
+each car first shows up small near the horizon and grows as it gets
+closer. A car can only be told apart from other cars of the same colour
+once it is big, roughly 160 px wide or more. Going forwards, the tracker
+therefore only becomes sure it has the Audi late in the car's trip, and all
+the small, far-away frames before that are lost. Going backwards, the same
+car starts big at the bottom of the frame, is recognised straight away, and
+is then followed as it shrinks back toward the horizon. That recovers the
+early frames. For each frame the merge keeps whichever pass found the car,
+or the higher-scoring box if both did.
+
+This only works on a recorded video. The backward pass starts from the last
+frame, so the whole clip has to exist before it can begin. For a live
+camera use `--forward-only`, which processes frames as they arrive. It is
+about twice as fast, but recall drops from about 0.87 to about 0.5 because
+the far-away part of each car's trip is missed.
+
+| | `--forward-only` | two passes (default) |
+| --- | --- | --- |
+| input | live stream or recorded video | recorded video only |
+| recall on this clip | about 0.5 | about 0.87 |
+| speed | about 2x faster | slower, both passes run |
 
 ## Results on the real clip
 
@@ -107,8 +145,8 @@ agreement with a strong detector rather than accuracy against hand labels.
 
 | | recall (IoU 0.5) | precision (IoU 0.3) | identity swaps | boxes where GT has none |
 | --- | --- | --- | --- | --- |
-| Silver Audi (499 frames in view) | 0.89 | 0.96 | 0 | 0 |
-| Blue Toyota (608 frames in view) | 0.81 | 0.96 | 0 | 0 |
+| Silver Audi (499 frames in view) | 0.87 | 1.00 | 0 | 0 |
+| Blue Toyota (608 frames in view) | 0.88 | 1.00 | 0 | 0 |
 
 The settings that came from tuning on a synthetic clip scored zero on the
 real one. They acquired look-alike cars in the first second and never
@@ -122,31 +160,20 @@ colour. The tracker reports `searching` there instead of guessing.
 ## Speed
 
 Measured on a 12-core laptop CPU at the default processing width of 960 px,
-tracking only (decoding adds about 10 s for the clip). These were measured
-one run at a time, but other work was sometimes running on the machine, so
-treat them as approximate. Every run writes its own timing to
-`summary.json` under `timing`.
+tracking only (decoding adds about 10 s for the clip). Other work was often
+running on the machine, and these were measured before the gallery was
+added (which adds a little work per candidate), so treat them as
+approximate. Every run writes its own timing to `summary.json` under
+`timing`.
 
-| | full detection every frame | every 5th frame (default) | every 10th frame |
+| | full detection every frame | every 5th frame | every 10th frame (default) |
 | --- | --- | --- | --- |
 | forward only (`--forward-only`) | 6 fps | 23 fps | 39 fps |
 | two passes (default) | 3 fps | 11 fps | 18 fps |
 
-Forward-only can run on a live stream and keeps up with a 20 to 25 fps
-camera at the default setting. The two-pass mode needs the end of the clip
-before it can start, so it is offline only. Every 10th frame is faster but
-lets the Audi track slide onto another car for about 50 frames on this clip,
-which is why the default is 5. Details are in `docs/experiments.md`.
-
-To rebuild the ground truth you need an NVIDIA GPU and the ONNX model from
-the [vehicle-tracker](https://github.com/joeljose/vehicle-tracker) project:
-
-```bash
-make build-gt
-make gt-all          # copy model, detect every frame, link and pick targets
-make eval            # score output/run against gt/gt.json
-make compare         # output/run/compare.mp4, tracker vs ground truth
-```
+Forward-only can run on a live stream and, at the default setting, keeps up
+with a 25 to 30 fps camera. Two passes need a recorded video (see above).
+Details are in `docs/experiments.md`.
 
 ## Tuning on new footage
 
@@ -195,7 +222,8 @@ refs/                      the two reference images
   tell apart from similar cars. Those frames stay `searching`.
 - When the two targets drive side by side their blob merges, and the box
   can come out loose (IoU between 0.3 and 0.5 with the ground truth).
-- The default two-pass mode is offline only and runs at about 11 fps.
+- The default two-pass mode works on recorded video only and runs at
+  roughly 18 fps.
   Live use needs `--forward-only`, which loses most of the early, far-away
   frames (recall about 0.5 instead of 0.85).
 - A car is called `exited` once it is about half out of the bottom of the

@@ -172,6 +172,55 @@ The source is 50 fps. Forward-only at N=5 keeps up with a 20 to 25 fps
 stream. Two passes cannot run live at any speed, because the backward pass
 starts from the last frame.
 
+## Remembering what the car looks like now
+
+At N=1 and N=10 the Audi track still slid onto another silver car for a
+short stretch. Up to here the tracker kept two kinds of memory: the fixed
+reference photo, and an online colour histogram plus a template that was
+replaced on every accepted frame. A neighbour can resemble the photo as
+much as the Audi does, especially when both are small, and one bad accepted
+frame replaced the template, which the cheap frames then followed.
+
+The online colour model is now replaced by a gallery per track: the
+colour histograms and HOG of the last 10 confirmed looks of the car. A
+look is only added (and the template only replaced) when the match scores
+at least as well against the photo as this track usually does. A candidate
+in a full frame, and a template match in a cheap frame, must resemble the
+gallery with similarity of at least `--gallery-floor`. The photo still
+decides identity. The gallery tells the car apart from a neighbour that
+fits the photo equally well, because the neighbour does not look like the
+car did a moment ago.
+
+Gallery floor, two passes, full detection every 10th frame:
+
+| floor | Audi recall | Audi precision | Toyota recall | Toyota precision | hidden |
+| --- | --- | --- | --- | --- | --- |
+| 0.60 | 0.87 | 0.90 | 0.89 | 1.00 | 42 |
+| 0.70 | 0.87 | 0.91 | 0.87 | 1.00 | 41 |
+| 0.75 | 0.87 | 1.00 | 0.88 | 1.00 | 0 |
+| 0.80 | 0.88 | 0.99 | 0.85 | 1.00 | 0 |
+| 0.85 | 0.86 | 1.00 | 0.75 | 1.00 | 0 |
+
+0.75 is the default. Below it the slide comes back, above it the Toyota is
+dropped too often.
+
+With the gallery (floor 0.75):
+
+| mode | N | Audi recall | Audi precision | Toyota recall | Toyota precision | swaps | hidden |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| forward only | 1 | 0.55 | 0.87 | 0.51 | 1.00 | 0 | 27 |
+| forward only | 5 | 0.55 | 1.00 | 0.48 | 1.00 | 0 | 0 |
+| forward only | 10 | 0.46 | 1.00 | 0.51 | 1.00 | 0 | 0 |
+| two passes | 1 | 0.90 | 0.92 | 0.85 | 0.97 | 0 | 27 |
+| two passes | 5 | 0.89 | 0.98 | 0.81 | 0.99 | 0 | 0 |
+| two passes | 10 | 0.87 | 1.00 | 0.88 | 1.00 | 0 | 0 |
+
+N=10 with two passes is now the default: no boxes on a wrong car, the best
+balance of recall between the two cars, and the fastest setting. The gallery
+fixed the slide at N=10 but not at N=1. Running the full pipeline on every
+frame offers the association more chances to accept a near-identical
+neighbour, and the gallery floor does not catch all of them.
+
 ## Reproducing
 
 ```bash

@@ -18,13 +18,14 @@ Pipeline per frame:
 from __future__ import annotations
 
 import itertools
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
 import cv2
 import numpy as np
 
-from .appearance import AppearanceModel
+from .appearance import AppearanceModel, Signature, signature, signature_similarity
 from .detection import Box, DetectorConfig, MotionDetector, clip_box, crop, iou
 from .kalman import BoxKalman
 
@@ -58,10 +59,11 @@ class TrackerConfig:
     refine_scales: tuple[float, ...] = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.42)
     max_coast: int = 25               # frames a track may go unmeasured before LOST
     template_threshold: float = 0.65  # NCC needed for template fallback
-    online_rate: float = 0.1          # online colour-model adaptation rate
+    gallery_size: int = 10            # recent confirmed looks kept per track
+    gallery_floor: float = 0.75       # a match must resemble the track's recent looks this much
     exit_margin: float = 0.35         # fraction of predicted box outside frame -> exited
     reacquire_after_exit: bool = True
-    detect_every: int = 5             # full detection every N frames, template following in between
+    detect_every: int = 10            # full detection every N frames, template following in between
     detector: DetectorConfig = field(default_factory=DetectorConfig)
 
 
@@ -85,6 +87,10 @@ class _Target:
     template: np.ndarray | None = None
     pending: list[tuple[int, Box, float]] = field(default_factory=list)
     exit_in: int | None = None  # frames left once the box reached the bottom edge
+    # Recent confirmed looks of this track. The reference photo anchors the
+    # identity; the gallery describes the car as it looks now (size, light),
+    # which tells it apart from a neighbour that resembles the photo as much.
+    gallery: deque[Signature] = field(default_factory=deque)
 
     @property
     def name(self) -> str:
@@ -192,6 +198,9 @@ class VehicleTracker:
             if np.count_nonzero(crop(fg, hit[0])) < 0.3 * hit[0][2] * hit[0][3]:
                 return None
             patch = crop(frame, hit[0])
+            recent = self._gallery_score(t, patch)
+            if recent is not None and recent < self.cfg.gallery_floor:
+                return None
             own = t.model.color_score(patch)
             if any(o.model.color_score(patch) > own for o in self.targets if o is not t):
                 return None
@@ -293,9 +302,11 @@ class VehicleTracker:
                 others = [ref_scores[k, j] for k in range(len(self.targets)) if k != i]
                 if others and max(others) > ref + cfg.acquire_margin:
                     continue
-                online = t.model.color_score(patches[j], online=True)
+                recent = self._gallery_score(t, patches[j])
+                if recent is not None and recent < cfg.gallery_floor:
+                    continue
                 motion = 1.0 - dist / gate
-                opts.append((j, 0.5 * ref + 0.25 * online + 0.25 * motion))
+                opts.append((j, 0.5 * ref + 0.25 * (ref if recent is None else recent) + 0.25 * motion))
             options[i] = opts
 
         best: dict[int, int] = {}
@@ -339,9 +350,10 @@ class VehicleTracker:
         else:
             t.low_score_run = 0
         patch = crop(frame, box)
-        if status == Status.TRACKED and score >= cfg.keep_threshold:
-            t.model.update_online(patch, cfg.online_rate)
-            t.template = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        # Only matches as good as this track usually gets go into the gallery
+        # and the template, so one doubtful frame cannot redefine the car.
+        if status == Status.TRACKED and score >= max(cfg.keep_threshold, t.score_ema - 0.05):
+            self._remember(t, patch)
         if t.low_score_run > cfg.identity_patience:
             # Sustained weak resemblance to the reference: likely drifted onto
             # another vehicle. Drop instead of reporting a wrong identity.
@@ -368,7 +380,19 @@ class VehicleTracker:
         t.template = None
         t.exit_in = None
         t.pending.clear()
-        t.model.reset_online()
+        t.gallery.clear()
+
+    def _gallery_score(self, t: _Target, patch: np.ndarray) -> float | None:
+        if not t.gallery or patch.size == 0 or min(patch.shape[:2]) < 8:
+            return None
+        sig = signature(patch)
+        return max(signature_similarity(sig, g) for g in t.gallery)
+
+    def _remember(self, t: _Target, patch: np.ndarray) -> None:
+        t.gallery.append(signature(patch))
+        while len(t.gallery) > self.cfg.gallery_size:
+            t.gallery.popleft()
+        t.template = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
 
     def _min_ref(self, t: _Target) -> float:
         """Lowest reference score still accepted as this target.
@@ -484,8 +508,6 @@ class VehicleTracker:
         t.status = Status.TRACKED
         t.missed = 0
         t.low_score_run = 0
-        patch = crop(frame, box)
-        t.model.reset_online()
-        t.model.update_online(patch, cfg.online_rate)
-        t.template = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        t.gallery.clear()
+        self._remember(t, crop(frame, box))
         return FrameResult(self.frame_idx, t.name, Status.TRACKED, box, best_s)

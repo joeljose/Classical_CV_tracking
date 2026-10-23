@@ -70,9 +70,15 @@ mean-shift tracking [14]. Hue and saturation separate a blue car from a red
 one easily. They do not separate silver, grey and white cars, which all have
 near-zero saturation and differ mainly in brightness. That is why our model
 keeps a separate value (brightness) histogram and gives it real weight.
-Colour also changes with distance and lighting, so the tracker keeps an
-online colour model for association but checks identity against the fixed
-reference.
+Colour also changes with distance and lighting. The tracker therefore
+keeps a short gallery of how each car looked recently, for association,
+but checks identity against the fixed reference. Updating an appearance
+model from the tracker's own output is the template update problem
+described by Matthews et al. [37]: update too eagerly and the model drifts
+onto whatever it last matched, never update and it stops fitting the
+object. Their fix is to keep the first template as an anchor and accept an
+update only when it is consistent with it. The gallery follows the same
+idea, with the reference photo as the anchor.
 
 ### Shape and texture
 
@@ -189,3 +195,4 @@ used only for this comparison and never feeds the tracker.
 34. N. Aharon, R. Orfaig, B.-Z. Bobrovsky. BoT-SORT: robust associations multi-pedestrian tracking. arXiv:2206.14651, 2022.
 35. K. Bernardin, R. Stiefelhagen. Evaluating multiple object tracking performance: the CLEAR MOT metrics. EURASIP JIVP 2008.
 36. J. Luiten et al. HOTA: a higher order metric for evaluating multi-object tracking. IJCV 129, 2021.
+37. I. Matthews, T. Ishikawa, S. Baker. The template update problem. IEEE TPAMI 26(6), 2004.

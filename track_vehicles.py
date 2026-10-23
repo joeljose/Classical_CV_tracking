@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     d = TrackerConfig()
     p.add_argument("--acquire-threshold", type=float, default=d.acquire_threshold)
     p.add_argument("--keep-threshold", type=float, default=d.keep_threshold)
+    p.add_argument("--gallery-floor", type=float, default=d.gallery_floor,
+                   help="how closely a match must resemble the track's recent looks")
     p.add_argument("--identity-threshold", type=float, default=d.identity_threshold)
     p.add_argument("--confirm-frames", type=int, default=d.confirm_frames)
     p.add_argument("--max-coast", type=int, default=d.max_coast)
@@ -155,6 +157,7 @@ def main() -> None:
     cfg = TrackerConfig(acquire_threshold=args.acquire_threshold, keep_threshold=args.keep_threshold,
                         confirm_frames=args.confirm_frames, max_coast=args.max_coast,
                         identity_threshold=args.identity_threshold,
+                        gallery_floor=args.gallery_floor,
                         acquire_min_width=args.acquire_min_width,
                         reacquire_after_exit=not args.no_reacquire,
                         detect_every=args.detect_every,

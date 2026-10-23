@@ -70,6 +70,20 @@ def hog_vector(patch_bgr: np.ndarray) -> np.ndarray:
     return v / n if n > 0 else v
 
 
+Signature = tuple[np.ndarray, np.ndarray, np.ndarray]  # H-S hist, V hist, HOG
+
+
+def signature(patch_bgr: np.ndarray) -> Signature:
+    """Colour and shape of one patch, for comparing a track with itself."""
+    hs, v = color_histograms(patch_bgr)
+    return hs, v, hog_vector(patch_bgr)
+
+
+def signature_similarity(a: Signature, b: Signature) -> float:
+    color = 0.6 * hist_similarity(a[0], b[0]) + 0.4 * hist_similarity(a[1], b[1])
+    return 0.75 * color + 0.25 * max(0.0, float(a[2] @ b[2]))
+
+
 @dataclass
 class ScoreBreakdown:
     total: float
@@ -96,16 +110,10 @@ class AppearanceModel:
         gray = cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2GRAY)
         self.ref_kp, self.ref_desc = self._sift.detectAndCompute(gray, None)
 
-        # Online colour model, adapted while the target is confidently tracked
-        # so that gradual changes (scale, lighting) do not break association.
-        # Identity checks always use the fixed reference model above.
-        self.online_hs = self.hs.copy()
-        self.online_v = self.v.copy()
-
     # ------------------------------------------------------------------ cues
-    def color_score(self, patch_bgr: np.ndarray, online: bool = False) -> float:
+    def color_score(self, patch_bgr: np.ndarray) -> float:
         hs, v = color_histograms(patch_bgr)
-        ref_hs, ref_v = (self.online_hs, self.online_v) if online else (self.hs, self.v)
+        ref_hs, ref_v = self.hs, self.v
         # Brightness matters as much as chroma: silver vs. grey/white cars share
         # near-zero saturation and differ mostly in V.
         return 0.6 * hist_similarity(hs, ref_hs) + 0.4 * hist_similarity(v, ref_v)
@@ -147,10 +155,10 @@ class AppearanceModel:
             return 0.0
         return 0.75 * self.color_score(patch_bgr) + 0.25 * self.hog_score(patch_bgr)
 
-    def score(self, patch_bgr: np.ndarray, online: bool = False) -> ScoreBreakdown:
+    def score(self, patch_bgr: np.ndarray) -> ScoreBreakdown:
         if patch_bgr.size == 0 or min(patch_bgr.shape[:2]) < 8:
             return ScoreBreakdown(0.0, 0.0, 0.0, None)
-        c = self.color_score(patch_bgr, online=online)
+        c = self.color_score(patch_bgr)
         g = self.hog_score(patch_bgr)
         k = self.keypoint_score(patch_bgr)
         if k is None:
@@ -160,12 +168,3 @@ class AppearanceModel:
             # patch should not veto a strong colour/shape match.
             total = max(0.75 * c + 0.25 * g, 0.5 * c + 0.15 * g + 0.35 * k)
         return ScoreBreakdown(float(total), c, g, k)
-
-    def update_online(self, patch_bgr: np.ndarray, rate: float) -> None:
-        hs, v = color_histograms(patch_bgr)
-        self.online_hs = (1 - rate) * self.online_hs + rate * hs
-        self.online_v = (1 - rate) * self.online_v + rate * v
-
-    def reset_online(self) -> None:
-        self.online_hs = self.hs.copy()
-        self.online_v = self.v.copy()
